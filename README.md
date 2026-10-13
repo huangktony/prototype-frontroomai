@@ -20,6 +20,7 @@ CCTV video  ->  extract_frames.py  ->  frames (.jpg)  ->  shelf_metrics.py  ->  
 
 - [extract_frames.py](extract_frames.py) pulls a frame every N seconds from a local video file.
 - [shelf_metrics.py](shelf_metrics.py) sends one frame to Gemini and prints structured JSON (the schema is the `ShelfMetrics` class in the file; edit it to change the metrics).
+- [run_batch.py](run_batch.py) runs `shelf_metrics.py` over a whole folder of frames and writes one CSV for comparing them.
 
 ## Setup
 
@@ -57,7 +58,13 @@ One frame:
 python shelf_metrics.py test_frames/4WXZTF7EWL0_00010s.jpg --out results/4WXZTF7EWL0_00010s.json
 ```
 
-All frames:
+All frames, one CSV row per frame ([run_batch.py](run_batch.py)):
+```
+python run_batch.py test_frames --limit 10
+```
+Start with `--limit 10`, since every frame is one API call. The CSV lands in `results/summary.csv` (change with `--out`) and includes the metrics, Gemini's notes, and an `error` column for frames that failed. Failed frames don't stop the run. `--repeats 3` runs each frame several times and prints how much the gap count varies between runs, which is a quick consistency check. To compare against reality, hand-count gaps on 10-15 frames and add a `manual_gaps` column next to Gemini's `out_of_stock_gap_count`.
+
+Or loop over single frames, saving one JSON file per frame:
 ```
 mkdir -p results
 for f in test_frames/*.jpg; do python shelf_metrics.py "$f" --out "results/$(basename "$f" .jpg).json"; done
