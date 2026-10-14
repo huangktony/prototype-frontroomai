@@ -3,3 +3,5 @@ __pycache__/
 videos/
 test_frames/
 results/
+layouts/*.jpg
+presentation/

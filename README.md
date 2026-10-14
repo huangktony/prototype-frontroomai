@@ -15,11 +15,17 @@ If the numbers hold up on real CCTV-quality frames, this could feed restock aler
 ## How it works
 
 ```
-CCTV video  ->  extract_frames.py  ->  frames (.jpg)  ->  shelf_metrics.py  ->  Gemini  ->  JSON metrics
+CCTV video -> extract_frames.py -> frames (.jpg)
+                                     |
+            pass 1 (once per camera) detect_shelves.py -> layouts/<camera>.json
+                                     |
+            pass 2 (every frame)     shelf_metrics.py: crop each unit -> Gemini -> JSON metrics
 ```
 
 - [extract_frames.py](extract_frames.py) pulls a frame every N seconds from a local video file.
-- [shelf_metrics.py](shelf_metrics.py) sends one frame to Gemini and prints structured JSON (the schema is the `ShelfMetrics` class in the file; edit it to change the metrics).
+- [detect_shelves.py](detect_shelves.py) (pass 1) asks Gemini for every shelving unit and its levels as bounding boxes, and saves them to `layouts/<camera>.json` (schema: `CameraLayout`), plus a `layouts/<camera>.jpg` overlay to check by eye. The cameras are fixed, so this runs once per camera. The camera ID is the video name in the frame filename. If a box is wrong, edit the JSON by hand. Re-detect with `--force`.
+- [shelf_metrics.py](shelf_metrics.py) (pass 2) loads the camera's layout, crops and upscales each unit, outlines its levels as L1, L2, ..., and sends one Gemini call per unit (in parallel). Output is per-unit, per-level metrics (`ShelfMetrics`) plus an area-weighted overall fill. If the camera has no layout yet, it runs pass 1 on that frame first.
+- [present_layout.py](present_layout.py) draws the saved layout as transparent yellow highlights on a frame, for slides (`presentation/`).
 
 ## Setup
 
@@ -52,9 +58,20 @@ The videos belong to their uploaders and show real people. They're for private p
 
 ## Run
 
-One frame:
+Map the shelves once per camera, on a frame with nobody blocking them, and check the overlay:
+```
+python detect_shelves.py test_frames/4WXZTF7EWL0_00016s.jpg
+python detect_shelves.py test_frames/-1bRhYjw1qE_00012s.jpg
+```
+
+One frame (add `--save-crops crops/` to see exactly what Gemini was sent):
 ```
 python shelf_metrics.py test_frames/4WXZTF7EWL0_00010s.jpg --out results/4WXZTF7EWL0_00010s.json
+```
+
+Slide image of the detected regions (`--no-levels` for whole units only):
+```
+python present_layout.py test_frames/4WXZTF7EWL0_00016s.jpg
 ```
 
 All frames:
