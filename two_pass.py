@@ -41,7 +41,7 @@ from pydantic import BaseModel, Field
 
 from polygons import (Polygon, clean_polygon, link_and_number, polygon_area, polygon_iou,
                       straighten, to_pixels)
-from shelf_metrics import DEFAULT_MODEL, generate_structured
+from shelf_metrics import DEFAULT_MODEL, QuotaExhausted, generate_structured
 
 POLYGON_HELP = ("4 corners [[y, x], ...] normalised 0-1000, in the order top-left, "
                 "top-right, bottom-right, bottom-left")
@@ -232,7 +232,11 @@ def score_regions(client, args, img, stem: str, kept: list[dict]) -> list[dict]:
         crops_dir.mkdir(parents=True, exist_ok=True)
     polygons = {k["id"]: k["polygon"] for k in kept}
     regions = []
+    quota_error = None
     for k in kept:
+        if quota_error:  # every later call would fail too; record it and keep what we have
+            regions.append({**k, "metrics": None, "error": "not scored: quota exhausted"})
+            continue
         fronts = [polygons[i] for i in k["hidden_by"] if i in polygons]
         crop = straighten(img, k["polygon"], fronts, args.pad)
         if args.save_crops:
@@ -242,6 +246,11 @@ def score_regions(client, args, img, stem: str, kept: list[dict]) -> list[dict]:
         except errors.ServerError as e:  # retries exhausted; keep the rest of the run
             regions.append({**k, "metrics": None, "error": f"{e.code} {e.status}"})
             print(f"  {k['id']} {k['label']!r}: FAILED ({e.code}), skipping", file=sys.stderr)
+            continue
+        except QuotaExhausted as e:
+            quota_error = e
+            regions.append({**k, "metrics": None, "error": "not scored: quota exhausted"})
+            print(f"  {k['id']} {k['label']!r}: {e}", file=sys.stderr)
             continue
         regions.append({**k, "metrics": metrics.model_dump()})
         print(f"  {k['id']} {k['label']!r}: fill {metrics.fill_percent:.0f}%, "
@@ -418,7 +427,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except QuotaExhausted as e:  # e.g. pass 1 or `detect` hit the limit before anything was saved
+        print(e, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

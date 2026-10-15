@@ -13,6 +13,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import sys
 import time
 from typing import Literal
@@ -23,6 +24,7 @@ from pydantic import BaseModel, Field
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 MAX_ATTEMPTS = 5
+MAX_RATE_LIMIT_WAIT = 90  # seconds; a longer 429 wait is a daily quota, so fail instead of hanging
 
 PROMPT = """You are analysing a single frame from a CCTV camera in a retail store.
 The frame shows one or more product shelves. Estimate retail shelf metrics from
@@ -54,8 +56,12 @@ class ShelfMetrics(BaseModel):
     notes: str = Field(description="Caveats, image quality issues, anything notable")
 
 
+class QuotaExhausted(RuntimeError):
+    """Gemini's rate limit or daily quota was hit and won't clear soon."""
+
+
 def generate_structured(client: genai.Client, model: str, contents: list, schema: type[BaseModel]):
-    """Call Gemini with a pydantic response schema, retrying on 5xx errors."""
+    """Call Gemini with a pydantic response schema, retrying on 5xx errors and short rate limits."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             response = client.models.generate_content(
@@ -68,6 +74,19 @@ def generate_structured(client: genai.Client, model: str, contents: list, schema
                 ),
             )
             break
+        except errors.ClientError as e:
+            if e.code != 429:
+                raise
+            match = re.search(r"'retryDelay': '(\d+)s'", str(e))
+            delay = int(match.group(1)) + 1 if match else 60
+            if delay > MAX_RATE_LIMIT_WAIT or attempt == MAX_ATTEMPTS:
+                # A daily quota (the free tier allows about 20 requests per day per model).
+                raise QuotaExhausted(
+                    f"Gemini quota exhausted for {model}; it resets in about {max(delay // 60, 1)} "
+                    f"minutes. Wait, enable billing on the key, or try another model with --model."
+                ) from e
+            print(f"Gemini rate limit (429); waiting {delay}s ({attempt}/{MAX_ATTEMPTS})", file=sys.stderr)
+            time.sleep(delay)
         except errors.ServerError as e:  # 5xx, e.g. 503 "high demand"
             if attempt == MAX_ATTEMPTS:
                 raise
@@ -104,7 +123,11 @@ def main() -> int:
         print("Set GEMINI_API_KEY first.", file=sys.stderr)
         return 1
 
-    metrics = analyse(args.image, args.model, api_key)
+    try:
+        metrics = analyse(args.image, args.model, api_key)
+    except QuotaExhausted as e:
+        print(e, file=sys.stderr)
+        return 1
     output = json.dumps(metrics.model_dump(), indent=2)
     print(output)
     if args.out:
