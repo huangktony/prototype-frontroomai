@@ -54,22 +54,16 @@ class ShelfMetrics(BaseModel):
     notes: str = Field(description="Caveats, image quality issues, anything notable")
 
 
-def analyse(image_path: str, model: str, api_key: str) -> ShelfMetrics:
-    mime, _ = mimetypes.guess_type(image_path)
-    if not mime or not mime.startswith("image/"):
-        raise ValueError(f"{image_path} does not look like an image file")
-    with open(image_path, "rb") as f:
-        image_bytes = f.read()
-
-    client = genai.Client(api_key=api_key)
+def generate_structured(client: genai.Client, model: str, contents: list, schema: type[BaseModel]):
+    """Call Gemini with a pydantic response schema, retrying on 5xx errors."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             response = client.models.generate_content(
                 model=model,
-                contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime), PROMPT],
+                contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=ShelfMetrics,
+                    response_schema=schema,
                     temperature=0.0,
                 ),
             )
@@ -84,6 +78,18 @@ def analyse(image_path: str, model: str, api_key: str) -> ShelfMetrics:
     if response.parsed is None:
         raise RuntimeError(f"Gemini returned no parseable output: {response.text!r}")
     return response.parsed
+
+
+def analyse(image_path: str, model: str, api_key: str) -> ShelfMetrics:
+    mime, _ = mimetypes.guess_type(image_path)
+    if not mime or not mime.startswith("image/"):
+        raise ValueError(f"{image_path} does not look like an image file")
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
+
+    client = genai.Client(api_key=api_key)
+    contents = [types.Part.from_bytes(data=image_bytes, mime_type=mime), PROMPT]
+    return generate_structured(client, model, contents, ShelfMetrics)
 
 
 def main() -> int:
