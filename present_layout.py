@@ -26,7 +26,7 @@ def outline(out: np.ndarray, mask: np.ndarray, thickness: int) -> None:
 def draw_highlight(image: np.ndarray, layout: CameraLayout, levels: bool = True) -> np.ndarray:
     """Highlight only the visible part of each unit, so units behind others get cut away."""
     h, w = image.shape[:2]
-    masks = {s.shelf_id: visible_mask(s.box_2d, layout.front_boxes(s), w, h)
+    masks = {s.shelf_id: visible_mask(s.polygon, layout.front_polygons(s), w, h)
              for s in layout.shelves}
     # Fill through one mask so overlapping units don't stack into darker patches.
     union = np.zeros((h, w), np.uint8)
@@ -39,7 +39,7 @@ def draw_highlight(image: np.ndarray, layout: CameraLayout, levels: bool = True)
     for shelf in layout.shelves:
         if levels:
             for level in shelf.levels:
-                outline(out, visible_mask(level.box_2d, layout.front_boxes(shelf), w, h), 1)
+                outline(out, visible_mask(level.polygon, layout.front_polygons(shelf), w, h), 1)
         outline(out, masks[shelf.shelf_id], 2)
 
     # Labels last so no outline crosses them.

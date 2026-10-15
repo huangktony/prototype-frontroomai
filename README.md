@@ -19,13 +19,13 @@ CCTV video -> extract_frames.py -> frames (.jpg)
                                      |
             pass 1 (once per camera) detect_shelves.py -> layouts/<camera>.json
                                      |
-            pass 2 (every frame)     shelf_metrics.py: crop each unit -> Gemini -> JSON metrics
+            pass 2 (every frame)     shelf_metrics.py: straighten each unit -> Gemini -> JSON metrics
 ```
 
 - [extract_frames.py](extract_frames.py) pulls a frame every N seconds from a local video file.
-- [detect_shelves.py](detect_shelves.py) (pass 1) asks Gemini for every shelving unit and its levels as bounding boxes, and saves them to `layouts/<camera>.json` (schema: `CameraLayout`), plus a `layouts/<camera>.jpg` overlay to check by eye. The cameras are fixed, so this runs once per camera. The camera ID is the video name in the frame filename. If a box is wrong, edit the JSON by hand. Re-detect with `--force`.
-- [shelf_metrics.py](shelf_metrics.py) (pass 2) loads the camera's layout, crops and upscales each unit, outlines its levels as L1, L2, ..., and sends one Gemini call per unit (in parallel). Output is per-unit, per-level metrics (`ShelfMetrics`) plus an area-weighted overall fill. If the camera has no layout yet, it runs pass 1 on that frame first.
-- [present_layout.py](present_layout.py) draws the saved layout as transparent yellow highlights on a frame, for slides (`presentation/`).
+- [detect_shelves.py](detect_shelves.py) (pass 1) asks Gemini for every shelving unit and its levels as 4-corner polygons of their front faces, plus a depth rank (nearest the camera = 1). Where a nearer unit stands in front of part of another, that unit is recorded in `hidden_by`. The result is saved to `layouts/<camera>.json` (schema: `CameraLayout`), plus a `layouts/<camera>.jpg` overlay to check by eye. The cameras are fixed, so this runs once per camera. The camera ID is the video name in the frame filename. If a shape is wrong, edit the JSON by hand (corners are `[y, x]`, 0-1000, clockwise from top-left). Re-detect with `--force`.
+- [shelf_metrics.py](shelf_metrics.py) (pass 2) loads the camera's layout, perspective-warps each unit's polygon to an upright rectangle (so angled shelves are seen front-on), greys out nearer units in front of it, outlines its levels as L1, L2, ..., and sends one Gemini call per unit (in parallel). Output is per-unit, per-level metrics (`ShelfMetrics`) plus an area-weighted overall fill. If the camera has no layout yet, it runs pass 1 on that frame first.
+- [present_layout.py](present_layout.py) draws the visible part of each saved polygon as transparent yellow highlights on a frame, for slides (`presentation/`).
 
 ## Setup
 

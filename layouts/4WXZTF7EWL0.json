@@ -4,348 +4,697 @@
   "frame_width": 1280,
   "frame_height": 720,
   "model": "gemini-3.8-flash",
-  "created_at": "2026-10-14T22:38:41+00:00",
-  "notes": "The central gondola runs diagonally away from the camera, displaying its endcap directly to the camera and its left side down the aisle.",
+  "created_at": "2026-10-14T23:04:28+00:00",
+  "notes": "Perspective distortion from the wide-angle elevated CCTV view causes shelves along aisle corridors to converge steeply. Drink fridges are partially obscured by reflections and front-facing displays.",
   "shelves": [
     {
       "shelf_id": "S1",
-      "label": "left foreground wall rack",
-      "box_2d": [
-        3,
-        0,
-        995,
-        126
+      "label": "left wall shelving",
+      "polygon": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          105
+        ],
+        [
+          989,
+          131
+        ],
+        [
+          989,
+          0
+        ]
       ],
-      "depth": 1,
+      "depth": 2,
       "hidden_by": [],
       "levels": [
         {
           "level_id": "S1-L1",
           "level": 1,
-          "box_2d": [
-            3,
-            0,
-            219,
-            84
+          "polygon": [
+            [
+              0,
+              0
+            ],
+            [
+              0,
+              105
+            ],
+            [
+              135,
+              96
+            ],
+            [
+              137,
+              0
+            ]
           ]
         },
         {
           "level_id": "S1-L2",
           "level": 2,
-          "box_2d": [
-            209,
-            0,
-            501,
-            67
+          "polygon": [
+            [
+              122,
+              0
+            ],
+            [
+              122,
+              98
+            ],
+            [
+              266,
+              96
+            ],
+            [
+              270,
+              0
+            ]
           ]
         },
         {
           "level_id": "S1-L3",
           "level": 3,
-          "box_2d": [
-            501,
-            0,
-            820,
-            63
+          "polygon": [
+            [
+              264,
+              0
+            ],
+            [
+              264,
+              96
+            ],
+            [
+              485,
+              97
+            ],
+            [
+              493,
+              0
+            ]
           ]
         },
         {
           "level_id": "S1-L4",
           "level": 4,
-          "box_2d": [
-            812,
-            0,
-            995,
-            66
+          "polygon": [
+            [
+              485,
+              0
+            ],
+            [
+              485,
+              99
+            ],
+            [
+              765,
+              109
+            ],
+            [
+              775,
+              0
+            ]
+          ]
+        },
+        {
+          "level_id": "S1-L5",
+          "level": 5,
+          "polygon": [
+            [
+              765,
+              0
+            ],
+            [
+              765,
+              112
+            ],
+            [
+              990,
+              126
+            ],
+            [
+              990,
+              0
+            ]
           ]
         }
       ]
     },
     {
       "shelf_id": "S2",
-      "label": "back wall left shelving bay",
-      "box_2d": [
-        8,
-        126,
-        404,
-        253
+      "label": "back wall shelving",
+      "polygon": [
+        [
+          0,
+          106
+        ],
+        [
+          0,
+          497
+        ],
+        [
+          406,
+          362
+        ],
+        [
+          416,
+          114
+        ]
       ],
-      "depth": 3,
-      "hidden_by": [],
+      "depth": 4,
+      "hidden_by": [
+        "S3"
+      ],
       "levels": [
         {
           "level_id": "S2-L1",
           "level": 1,
-          "box_2d": [
-            8,
-            126,
-            108,
-            253
+          "polygon": [
+            [
+              3,
+              106
+            ],
+            [
+              4,
+              466
+            ],
+            [
+              95,
+              476
+            ],
+            [
+              95,
+              107
+            ]
           ]
         },
         {
           "level_id": "S2-L2",
           "level": 2,
-          "box_2d": [
-            94,
-            126,
-            218,
-            248
+          "polygon": [
+            [
+              91,
+              107
+            ],
+            [
+              84,
+              499
+            ],
+            [
+              211,
+              495
+            ],
+            [
+              213,
+              108
+            ]
           ]
         },
         {
           "level_id": "S2-L3",
           "level": 3,
-          "box_2d": [
-            183,
-            126,
-            297,
-            248
+          "polygon": [
+            [
+              175,
+              109
+            ],
+            [
+              174,
+              381
+            ],
+            [
+              300,
+              380
+            ],
+            [
+              303,
+              111
+            ]
           ]
         },
         {
           "level_id": "S2-L4",
           "level": 4,
-          "box_2d": [
-            275,
-            126,
-            400,
-            247
+          "polygon": [
+            [
+              270,
+              111
+            ],
+            [
+              269,
+              363
+            ],
+            [
+              407,
+              362
+            ],
+            [
+              414,
+              114
+            ]
           ]
         }
       ]
     },
     {
       "shelf_id": "S3",
-      "label": "back wall right shelving bay",
-      "box_2d": [
-        8,
-        237,
-        381,
-        466
+      "label": "central gondola aisle shelving",
+      "polygon": [
+        [
+          96,
+          354
+        ],
+        [
+          456,
+          476
+        ],
+        [
+          930,
+          415
+        ],
+        [
+          490,
+          319
+        ]
       ],
-      "depth": 3,
-      "hidden_by": [
-        "S4"
-      ],
+      "depth": 2,
+      "hidden_by": [],
       "levels": [
         {
           "level_id": "S3-L1",
           "level": 1,
-          "box_2d": [
-            8,
-            246,
-            104,
-            466
+          "polygon": [
+            [
+              96,
+              354
+            ],
+            [
+              456,
+              476
+            ],
+            [
+              535,
+              458
+            ],
+            [
+              196,
+              347
+            ]
           ]
         },
         {
           "level_id": "S3-L2",
           "level": 2,
-          "box_2d": [
-            88,
-            241,
-            209,
-            383
+          "polygon": [
+            [
+              196,
+              347
+            ],
+            [
+              535,
+              458
+            ],
+            [
+              684,
+              437
+            ],
+            [
+              287,
+              340
+            ]
           ]
         },
         {
           "level_id": "S3-L3",
           "level": 3,
-          "box_2d": [
-            179,
-            237,
-            285,
-            375
+          "polygon": [
+            [
+              287,
+              340
+            ],
+            [
+              684,
+              437
+            ],
+            [
+              843,
+              422
+            ],
+            [
+              387,
+              333
+            ]
           ]
         },
         {
           "level_id": "S3-L4",
           "level": 4,
-          "box_2d": [
-            262,
-            239,
-            377,
-            365
+          "polygon": [
+            [
+              387,
+              333
+            ],
+            [
+              843,
+              422
+            ],
+            [
+              930,
+              415
+            ],
+            [
+              490,
+              319
+            ]
           ]
         }
       ]
     },
     {
       "shelf_id": "S4",
-      "label": "center gondola aisle shelves",
-      "box_2d": [
-        78,
-        317,
-        922,
-        563
+      "label": "gondola end-cap display",
+      "polygon": [
+        [
+          435,
+          478
+        ],
+        [
+          435,
+          680
+        ],
+        [
+          958,
+          620
+        ],
+        [
+          961,
+          437
+        ]
       ],
-      "depth": 2,
-      "hidden_by": [
-        "S5"
-      ],
+      "depth": 1,
+      "hidden_by": [],
       "levels": [
         {
           "level_id": "S4-L1",
           "level": 1,
-          "box_2d": [
-            78,
-            357,
-            509,
-            563
+          "polygon": [
+            [
+              435,
+              483
+            ],
+            [
+              435,
+              680
+            ],
+            [
+              635,
+              683
+            ],
+            [
+              641,
+              479
+            ]
           ]
         },
         {
           "level_id": "S4-L2",
           "level": 2,
-          "box_2d": [
-            200,
-            344,
-            575,
-            482
+          "polygon": [
+            [
+              606,
+              473
+            ],
+            [
+              601,
+              683
+            ],
+            [
+              766,
+              679
+            ],
+            [
+              775,
+              461
+            ]
           ]
         },
         {
           "level_id": "S4-L3",
           "level": 3,
-          "box_2d": [
-            292,
-            338,
-            717,
-            467
+          "polygon": [
+            [
+              737,
+              456
+            ],
+            [
+              733,
+              646
+            ],
+            [
+              869,
+              638
+            ],
+            [
+              873,
+              444
+            ]
           ]
         },
         {
           "level_id": "S4-L4",
           "level": 4,
-          "box_2d": [
-            386,
-            331,
-            844,
-            447
-          ]
-        },
-        {
-          "level_id": "S4-L5",
-          "level": 5,
-          "box_2d": [
-            480,
-            317,
-            915,
-            433
+          "polygon": [
+            [
+              812,
+              442
+            ],
+            [
+              806,
+              626
+            ],
+            [
+              953,
+              617
+            ],
+            [
+              957,
+              434
+            ]
           ]
         }
       ]
     },
     {
       "shelf_id": "S5",
-      "label": "foreground gondola endcap",
-      "box_2d": [
-        439,
-        424,
-        989,
-        718
+      "label": "red drinks fridge",
+      "polygon": [
+        [
+          28,
+          707
+        ],
+        [
+          96,
+          861
+        ],
+        [
+          419,
+          747
+        ],
+        [
+          324,
+          698
+        ]
       ],
-      "depth": 1,
-      "hidden_by": [],
+      "depth": 4,
+      "hidden_by": [
+        "S6"
+      ],
       "levels": [
         {
           "level_id": "S5-L1",
           "level": 1,
-          "box_2d": [
-            439,
-            477,
-            638,
-            718
+          "polygon": [
+            [
+              87,
+              736
+            ],
+            [
+              127,
+              819
+            ],
+            [
+              207,
+              789
+            ],
+            [
+              169,
+              725
+            ]
           ]
         },
         {
           "level_id": "S5-L2",
           "level": 2,
-          "box_2d": [
-            598,
-            467,
-            769,
-            684
+          "polygon": [
+            [
+              169,
+              725
+            ],
+            [
+              207,
+              789
+            ],
+            [
+              269,
+              766
+            ],
+            [
+              228,
+              715
+            ]
           ]
         },
         {
           "level_id": "S5-L3",
           "level": 3,
-          "box_2d": [
-            716,
-            446,
-            874,
-            652
-          ]
-        },
-        {
-          "level_id": "S5-L4",
-          "level": 4,
-          "box_2d": [
-            806,
-            438,
-            977,
-            624
+          "polygon": [
+            [
+              228,
+              715
+            ],
+            [
+              269,
+              766
+            ],
+            [
+              345,
+              742
+            ],
+            [
+              300,
+              703
+            ]
           ]
         }
       ]
     },
     {
       "shelf_id": "S6",
-      "label": "back right red drinks fridge",
-      "box_2d": [
-        26,
-        698,
-        423,
-        866
+      "label": "white drinks fridge",
+      "polygon": [
+        [
+          120,
+          737
+        ],
+        [
+          194,
+          893
+        ],
+        [
+          515,
+          796
+        ],
+        [
+          427,
+          738
+        ]
       ],
       "depth": 3,
       "hidden_by": [
-        "S7",
-        "S8"
+        "S7"
       ],
       "levels": [
         {
           "level_id": "S6-L1",
           "level": 1,
-          "box_2d": [
-            94,
-            760,
-            196,
-            821
+          "polygon": [
+            [
+              165,
+              762
+            ],
+            [
+              206,
+              866
+            ],
+            [
+              297,
+              839
+            ],
+            [
+              254,
+              747
+            ]
           ]
         },
         {
           "level_id": "S6-L2",
           "level": 2,
-          "box_2d": [
-            184,
-            750,
-            281,
-            800
+          "polygon": [
+            [
+              254,
+              747
+            ],
+            [
+              297,
+              839
+            ],
+            [
+              365,
+              819
+            ],
+            [
+              318,
+              739
+            ]
           ]
         },
         {
           "level_id": "S6-L3",
           "level": 3,
-          "box_2d": [
-            255,
-            717,
-            359,
-            781
+          "polygon": [
+            [
+              318,
+              739
+            ],
+            [
+              365,
+              819
+            ],
+            [
+              438,
+              798
+            ],
+            [
+              388,
+              739
+            ]
           ]
         }
       ]
     },
     {
       "shelf_id": "S7",
-      "label": "right side white drinks fridge",
-      "box_2d": [
-        115,
-        735,
-        517,
-        903
+      "label": "right side snack display stand",
+      "polygon": [
+        [
+          312,
+          783
+        ],
+        [
+          358,
+          896
+        ],
+        [
+          597,
+          843
+        ],
+        [
+          542,
+          785
+        ]
       ],
       "depth": 2,
       "hidden_by": [],
@@ -353,85 +702,67 @@
         {
           "level_id": "S7-L1",
           "level": 1,
-          "box_2d": [
-            170,
-            810,
-            269,
-            870
+          "polygon": [
+            [
+              312,
+              783
+            ],
+            [
+              358,
+              896
+            ],
+            [
+              441,
+              876
+            ],
+            [
+              393,
+              787
+            ]
           ]
         },
         {
           "level_id": "S7-L2",
           "level": 2,
-          "box_2d": [
-            248,
-            789,
-            360,
-            856
+          "polygon": [
+            [
+              393,
+              787
+            ],
+            [
+              441,
+              876
+            ],
+            [
+              520,
+              856
+            ],
+            [
+              469,
+              786
+            ]
           ]
         },
         {
           "level_id": "S7-L3",
           "level": 3,
-          "box_2d": [
-            321,
-            765,
-            439,
-            831
-          ]
-        },
-        {
-          "level_id": "S7-L4",
-          "level": 4,
-          "box_2d": [
-            397,
-            747,
-            501,
-            803
-          ]
-        }
-      ]
-    },
-    {
-      "shelf_id": "S8",
-      "label": "right wall snack wire rack",
-      "box_2d": [
-        203,
-        783,
-        597,
-        990
-      ],
-      "depth": 2,
-      "hidden_by": [],
-      "levels": [
-        {
-          "level_id": "S8-L1",
-          "level": 1,
-          "box_2d": [
-            333,
-            833,
-            447,
-            907
-          ]
-        },
-        {
-          "level_id": "S8-L2",
-          "level": 2,
-          "box_2d": [
-            415,
-            808,
-            514,
-            882
-          ]
-        },
-        {
-          "level_id": "S8-L3",
-          "level": 3,
-          "box_2d": [
-            468,
-            792,
-            574,
-            858
+          "polygon": [
+            [
+              469,
+              786
+            ],
+            [
+              520,
+              856
+            ],
+            [
+              597,
+              843
+            ],
+            [
+              542,
+              785
+            ]
           ]
         }
       ]

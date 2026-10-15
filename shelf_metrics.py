@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pass 2: crop each shelving unit from a CCTV frame and get structured shelf metrics.
+"""Pass 2: straighten each shelving unit from a CCTV frame and get structured shelf metrics.
 
 Shelf positions come from the camera's saved layout (see detect_shelves.py). If the
 camera has no layout yet, this frame is used to detect one, which is then saved and
@@ -26,17 +26,18 @@ import numpy as np
 from google.genai import errors
 from pydantic import BaseModel, Field
 
-from detect_shelves import (LAYOUTS_DIR, CameraLayout, Shelf, camera_id_for, detect_layout,
-                            load_layout, save_layout, to_pixels)
+from detect_shelves import (LAYOUTS_DIR, CameraLayout, Polygon, Shelf, camera_id_for,
+                            detect_layout, load_layout, save_layout, to_pixels)
 from gemini_util import DEFAULT_MODEL, generate, make_client
 
 CROP_PADDING = 0.04  # fraction of the unit's size added on each side
-MIN_LONG_SIDE = 1024  # upscale small crops to at least this many pixels on the long side
+MIN_LONG_SIDE = 1024  # scale straightened crops to at least this many pixels on the long side
 MAX_UPSCALE = 4.0
-HIDDEN_GREY = 128  # fill for parts of a crop covered by a nearer unit
+HIDDEN_GREY = 128  # fill for parts of a crop covered by a nearer unit or outside the frame
 
-PROMPT = """This image is a crop of one shelving unit ("{label}") from a retail CCTV frame,
-enlarged for detail. {levels_text} Report metrics for this unit and for each level.
+PROMPT = """This image is one shelving unit ("{label}") cut from a retail CCTV frame,
+perspective-corrected so its front faces the viewer, and enlarged for detail; expect
+some stretching and blur from that. {levels_text} Report metrics for this unit and for each level.
 Ignore anything outside the unit that belongs to neighbouring fixtures.
 Be conservative: if the image quality, angle, or occlusion (people, carts, glare)
 prevents a reliable estimate, lower the confidence and say why in `notes`. Do not
@@ -82,43 +83,47 @@ class FrameMetrics(BaseModel):
     shelves: list[ShelfResult]
 
 
-def crop_shelf(image: np.ndarray, shelf: Shelf, front_boxes: list[list[int]]) -> np.ndarray:
-    """Crop the unit with padding, grey out nearer units in front of it, upscale it,
-    and outline its levels as L1, L2, ..."""
+def straighten_shelf(image: np.ndarray, shelf: Shelf,
+                     front_polygons: list[Polygon]) -> np.ndarray:
+    """Warp the unit's 4-corner face to an upright rectangle, grey out nearer units in
+    front of it, and outline its levels as L1, L2, ..."""
     h, w = image.shape[:2]
-    if front_boxes:
+    if front_polygons:
         image = image.copy()
-        for front in front_boxes:
-            fx0, fy0, fx1, fy1 = to_pixels(front, w, h)
-            image[fy0:fy1, fx0:fx1] = HIDDEN_GREY
-    x0, y0, x1, y1 = to_pixels(shelf.box_2d, w, h)
-    pad_x, pad_y = round((x1 - x0) * CROP_PADDING), round((y1 - y0) * CROP_PADDING)
-    cx0, cy0 = max(x0 - pad_x, 0), max(y0 - pad_y, 0)
-    cx1, cy1 = min(x1 + pad_x, w), min(y1 + pad_y, h)
-    crop = image[cy0:cy1, cx0:cx1]
+        for front in front_polygons:
+            cv2.fillPoly(image, [to_pixels(front, w, h).round().astype(np.int32)],
+                         (HIDDEN_GREY,) * 3)
 
-    scale = min(max(MIN_LONG_SIDE / max(crop.shape[:2]), 1.0), MAX_UPSCALE)
-    if scale > 1:
-        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    else:
-        crop = crop.copy()
+    quad = to_pixels(shelf.polygon, w, h)
+    centre = quad.mean(axis=0)
+    quad = centre + (quad - centre) * (1 + 2 * CROP_PADDING)
+    tl, tr, br, bl = quad
+    width = max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))
+    height = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
+    scale = min(max(MIN_LONG_SIDE / max(width, height), 1.0), MAX_UPSCALE)
+    out_w, out_h = max(round(width * scale), 1), max(round(height * scale), 1)
+    warp = cv2.getPerspectiveTransform(
+        quad.astype(np.float32), np.float32([[0, 0], [out_w, 0], [out_w, out_h], [0, out_h]]))
+    out = cv2.warpPerspective(image, warp, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(HIDDEN_GREY,) * 3)
 
-    # Draw after upscaling so outlines stay thin relative to the products.
+    # Draw after warping so outlines stay thin relative to the products.
     for level in shelf.levels:
-        lx0, ly0, lx1, ly1 = to_pixels(level.box_2d, w, h)
-        p0 = (round((lx0 - cx0) * scale), round((ly0 - cy0) * scale))
-        p1 = (round((lx1 - cx0) * scale), round((ly1 - cy0) * scale))
-        cv2.rectangle(crop, p0, p1, (0, 255, 255), 2)
-        cv2.putText(crop, f"L{level.level}", (p0[0] + 4, p0[1] + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(crop, f"L{level.level}", (p0[0] + 4, p0[1] + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
-    return crop
+        pts = cv2.perspectiveTransform(to_pixels(level.polygon, w, h).reshape(-1, 1, 2), warp)
+        pts = pts.reshape(-1, 2).round().astype(np.int32)
+        cv2.polylines(out, [pts], True, (0, 255, 255), 2, cv2.LINE_AA)
+        org = (int(pts[0][0]) + 4, int(pts[0][1]) + 22)
+        cv2.putText(out, f"L{level.level}", org, cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(out, f"L{level.level}", org, cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 255, 255), 2, cv2.LINE_AA)
+    return out
 
 
 def shelf_prompt(shelf: Shelf) -> str:
-    hidden_text = (" Flat grey areas are other fixtures standing in front of this unit: ignore"
-                   " them, and do not count them as empty shelf space." if shelf.hidden_by else "")
+    hidden_text = (" Flat grey areas are other fixtures standing in front of this unit, or"
+                   " outside the camera's view: ignore them, and do not count them as empty"
+                   " shelf space.")
     if shelf.levels:
         labels = ", ".join(f"L{l.level}" for l in shelf.levels)
         levels_text = (f"Yellow outlines mark its {len(shelf.levels)} shelf levels, "
@@ -129,9 +134,9 @@ def shelf_prompt(shelf: Shelf) -> str:
 
 
 def analyse_shelf(client, model: str, image: np.ndarray, shelf: Shelf,
-                  front_boxes: list[list[int]], crops_dir: Path | None,
+                  front_polygons: list[Polygon], crops_dir: Path | None,
                   frame_stem: str) -> ShelfResult:
-    crop = crop_shelf(image, shelf, front_boxes)
+    crop = straighten_shelf(image, shelf, front_polygons)
     if crops_dir:
         cv2.imwrite(str(crops_dir / f"{frame_stem}_{shelf.shelf_id}.jpg"), crop)
     ok, jpeg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -149,12 +154,12 @@ def analyse_shelf(client, model: str, image: np.ndarray, shelf: Shelf,
 
 def overall_fill(layout: CameraLayout, results: list[ShelfResult]) -> float | None:
     """Average unit fill, weighted by each unit's area in the frame."""
-    boxes = {s.shelf_id: s.box_2d for s in layout.shelves}
+    areas = {s.shelf_id: cv2.contourArea(to_pixels(s.polygon, 1000, 1000))
+             for s in layout.shelves}
     total = weight = 0.0
     for r in results:
         if r.metrics and r.metrics.shelf_visible:
-            y0, x0, y1, x1 = boxes[r.shelf_id]
-            area = (y1 - y0) * (x1 - x0)
+            area = areas[r.shelf_id]
             total += r.metrics.fill_percent * area
             weight += area
     return round(total / weight, 1) if weight else None
@@ -185,7 +190,7 @@ def analyse(image_path: str, model: str, camera_id: str, layouts_dir: Path,
     stem = Path(image_path).stem
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(
-            lambda s: analyse_shelf(client, model, image, s, layout.front_boxes(s), crops_dir, stem),
+            lambda s: analyse_shelf(client, model, image, s, layout.front_polygons(s), crops_dir, stem),
             layout.shelves))
 
     return FrameMetrics(

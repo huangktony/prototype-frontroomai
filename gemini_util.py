@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 MAX_ATTEMPTS = 5
+MAX_RATE_LIMIT_WAIT = 120  # seconds; longer 429 waits fail instead of hanging
 
 
 def make_client() -> genai.Client:
@@ -49,8 +50,11 @@ def generate[T: BaseModel](client: genai.Client, model: str, image: bytes, mime:
                 raise
             wait = 5 * 2 ** (attempt - 1)
             if e.code == 429:  # the free tier is a few requests per minute; wait as told
-                match = re.search(r"retry in ([\d.]+)s", str(e))
-                wait = float(match.group(1)) + 1 if match else 60
+                match = re.search(r"'retryDelay': '(\d+)s'", str(e))
+                wait = int(match.group(1)) + 1 if match else 60
+                if wait > MAX_RATE_LIMIT_WAIT:  # a daily quota, not a per-minute one
+                    raise RuntimeError(f"Gemini quota exhausted; it resets in about "
+                                       f"{wait // 60} minutes. Use a paid key or wait.") from e
             print(f"Gemini error {e.code}; retrying in {wait:.0f}s "
                   f"({attempt}/{MAX_ATTEMPTS})", file=sys.stderr)
             time.sleep(wait)
