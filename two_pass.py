@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Two-pass shelf analysis with saved per-camera regions.
 
-Pass 1 asks Gemini for shelf sections (label + box + confidence) on the full frame.
-Weak sections are dropped (low confidence, bad geometry, duplicates). Pass 2 crops
-each kept section out of the original frame and scores it on its own.
+Pass 1 asks Gemini for shelf sections as 4-corner polygons (with confidence and depth) on
+the full frame. Weak sections are dropped (low confidence, bad geometry, duplicates). Pass 2
+straightens each kept section into an upright crop, greys out nearer units standing in
+front of it, and scores it on its own. Polygon handling is adapted from Parth's
+parthswork/polygons branch (see polygons.py).
 
 A fixed camera sees the same shelves every time, so pass 1 only needs to run once:
 
     # 1. Find regions on a few frames, keep the ones most frames agree on, save them
     python two_pass.py detect --camera store1 frame_a.jpg frame_b.jpg frame_c.jpg
     #    -> partitions/store1.json + partitions/store1_overlay.jpg  (open the overlay)
-    # 2. After checking the overlay (edit the JSON if a box is wrong), approve it
+    # 2. After checking the overlay (edit the JSON if a polygon is wrong), approve it
     python two_pass.py approve --camera store1
     # 3. Score any frame from that camera; pass 1 is skipped, region IDs stay the same
     python two_pass.py score --camera store1 frame.jpg --save-crops
@@ -37,26 +39,47 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
+from polygons import (Polygon, clean_polygon, link_and_number, polygon_area, polygon_iou,
+                      straighten, to_pixels)
 from shelf_metrics import DEFAULT_MODEL, generate_structured
 
-PASS1_PROMPT = """You are looking at a single frame from a CCTV camera in a retail store.
-List every distinct shelf section you can see: each gondola, wall shelf bay, endcap
-display, or cooler. One entry per physical unit, not per shelf tier. Give each a short
-label and a tight bounding box as [ymin, xmin, ymax, xmax], each normalized to 0-1000.
-`confidence` (0-1) is how sure you are that the box covers one real, clearly visible
-shelf section with products on it. Use a low value for anything mostly hidden, cut off
-by the frame edge, or too blurry to judge. Do not include floors, people, or checkouts."""
+POLYGON_HELP = ("4 corners [[y, x], ...] normalised 0-1000, in the order top-left, "
+                "top-right, bottom-right, bottom-left")
 
-PASS2_PROMPT = """This is a crop of one shelf section from a retail CCTV frame.
+PASS1_PROMPT = """You are looking at a single frame from a fixed CCTV camera in a retail store.
+List every distinct shelf section you can see: each gondola, wall shelf bay, endcap
+display, or cooler. One entry per physical unit, not per shelf tier. Skip units that are
+mostly out of frame, seen only edge-on, or too far away to make out products.
+
+For each, give a short label and a polygon of exactly 4 corners tracing its
+product-facing front face as it appears in perspective (a shelf seen at an angle is a
+slanted quadrilateral, not an upright rectangle). Give corners as [y, x] normalised to
+0-1000, in the order top-left, top-right, bottom-right, bottom-left.
+
+Give each a depth rank: 1 for the units nearest the camera, then 2, 3, ... for units
+further back; units at about the same distance share a rank. Trace each unit's whole
+face even where a nearer unit stands in front of it, because depth is used to work out
+what is hidden. People and carts move, so ignore them and trace the shelf as if they
+were not there.
+
+`confidence` (0-1) is how sure you are that the polygon covers one real, clearly visible
+shelf section with products on it. Use a low value for anything mostly hidden, cut off by
+the frame edge, or too blurry to judge. Do not include floors, people, or checkouts."""
+
+PASS2_PROMPT = """This image is one shelf section cut from a retail CCTV frame,
+perspective-corrected so its front faces the viewer and enlarged for detail; expect some
+stretching and blur from that. Flat grey areas are other fixtures standing in front of
+it, or outside the camera's view: ignore them and do not count them as empty shelf space.
 Estimate its stock state from what is visible. Do not guess about parts you cannot see.
 `visible_fraction` (0-1) is how much of the section is actually visible and unobstructed
-(people, carts, glare, or the crop edge reduce it). Percentages are 0-100."""
+(grey areas, people, carts and glare all reduce it). Percentages are 0-100."""
 
 
 class Section(BaseModel):
     label: str
     kind: Literal["gondola", "wall_shelf", "cooler", "endcap", "other"]
-    box_2d: list[int] = Field(description="[ymin, xmin, ymax, xmax], each 0-1000")
+    polygon: Polygon = Field(description=POLYGON_HELP)
+    depth: int = Field(description="1 = nearest the camera; higher = further back")
     confidence: float = Field(description="0-1, how sure this is a real, visible shelf section")
 
 
@@ -75,7 +98,7 @@ class RegionMetrics(BaseModel):
     notes: str
 
 
-# ---------- geometry ----------
+# ---------- pass 1 ----------
 
 def jpeg_part(img) -> types.Part:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -84,94 +107,39 @@ def jpeg_part(img) -> types.Part:
     return types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg")
 
 
-def to_pixels(box: list[int], w: int, h: int):
-    """Normalized [ymin, xmin, ymax, xmax] (0-1000) -> clamped pixel (x1, y1, x2, y2), or None."""
-    if len(box) != 4:
-        return None
-    ymin, xmin, ymax, xmax = (min(max(v, 0), 1000) for v in box)
-    x1, x2 = round(xmin / 1000 * w), round(xmax / 1000 * w)
-    y1, y2 = round(ymin / 1000 * h), round(ymax / 1000 * h)
-    return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
-
-
-def to_normalized(box_px, w: int, h: int) -> list[int]:
-    """Pixel (x1, y1, x2, y2) -> normalized [ymin, xmin, ymax, xmax] (0-1000)."""
-    x1, y1, x2, y2 = box_px
-    return [round(y1 / h * 1000), round(x1 / w * 1000), round(y2 / h * 1000), round(x2 / w * 1000)]
-
-
-def iou(a, b) -> float:
-    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
-    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
-    inter = ix * iy
-    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return inter / union if union else 0.0
-
-
-def filter_sections(sections: list[Section], w: int, h: int, min_conf: float):
+def filter_sections(sections: list[Section], min_conf: float):
     """Drop invalid, low-confidence, odd-shaped, or duplicate sections. Returns (kept, dropped)."""
     kept, dropped = [], []
-    # Highest confidence first, so duplicates lose to the better box.
+    # Highest confidence first, so duplicates lose to the better polygon.
     for s in sorted(sections, key=lambda s: s.confidence, reverse=True):
-        info = {"label": s.label, "kind": s.kind, "confidence": s.confidence}
-        box = to_pixels(s.box_2d, w, h)
-        if box is None:
-            dropped.append({**info, "box_px": None, "reason": "invalid box"})
+        info = {"label": s.label, "kind": s.kind, "confidence": s.confidence, "depth": max(s.depth, 1)}
+        polygon = clean_polygon(s.polygon)
+        if polygon is None:
+            dropped.append({**info, "polygon": None, "reason": "invalid polygon"})
             continue
-        info["box_px"] = list(box)
-        area = (box[2] - box[0]) * (box[3] - box[1]) / (w * h)
-        aspect = (box[2] - box[0]) / (box[3] - box[1])
+        info["polygon"] = polygon
+        area = polygon_area(polygon)
+        xs, ys = [x for _, x in polygon], [y for y, _ in polygon]
+        aspect = (max(xs) - min(xs)) / max(max(ys) - min(ys), 1)
         if s.confidence < min_conf:
             reason = f"confidence {s.confidence:.2f} < {min_conf}"
         elif area < 0.01 or area > 0.6:
             reason = f"area {area:.1%} outside 1%-60%"
         elif aspect > 8 or aspect < 1 / 8:
             reason = f"aspect ratio {aspect:.1f} too extreme"
-        elif any(iou(box, k["box_px"]) > 0.5 for k in kept):
+        elif any(polygon_iou(polygon, k["polygon"]) > 0.5 for k in kept):
             reason = "duplicate of a higher-confidence section"
         else:
             kept.append(info)
             continue
         dropped.append({**info, "reason": reason})
-    return number_left_to_right(kept), dropped
+    return kept, dropped
 
-
-def number_left_to_right(kept: list[dict]) -> list[dict]:
-    kept.sort(key=lambda k: (k["box_px"][0], k["box_px"][1]))
-    for i, k in enumerate(kept, 1):
-        k["id"] = f"s{i}"
-    return kept
-
-
-def crop_with_padding(img, box, pad: float):
-    h, w = img.shape[:2]
-    x1, y1, x2, y2 = box
-    px, py = round((x2 - x1) * pad), round((y2 - y1) * pad)
-    return img[max(y1 - py, 0): min(y2 + py, h), max(x1 - px, 0): min(x2 + px, w)]
-
-
-def draw_overlay(img, kept, dropped=()):
-    out = img.copy()
-    for d in dropped:
-        if d["box_px"]:
-            x1, y1, x2, y2 = d["box_px"]
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(out, "dropped", (x1 + 4, y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    for k in kept:
-        x1, y1, x2, y2 = k["box_px"]
-        text = k["id"] + (f" {k['confidence']:.2f}" if k.get("confidence") is not None else "")
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 200, 0), 3)
-        cv2.putText(out, text, (x1 + 4, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
-    return out
-
-
-# ---------- pass 1 ----------
 
 def detect_sections(client, model: str, img, min_conf: float):
-    """Run pass 1 on one frame. Returns (kept, dropped)."""
-    h, w = img.shape[:2]
+    """Run pass 1 on one frame. Returns (kept, dropped); kept isn't numbered yet."""
     found = generate_structured(client, model, [jpeg_part(img), PASS1_PROMPT], Sections)
-    kept, dropped = filter_sections(found.sections, w, h, min_conf)
+    kept, dropped = filter_sections(found.sections, min_conf)
     print(f"Pass 1: {len(found.sections)} sections found, {len(kept)} kept, {len(dropped)} dropped",
           file=sys.stderr)
     for d in dropped:
@@ -182,16 +150,15 @@ def detect_sections(client, model: str, img, min_conf: float):
 def consensus(per_frame: list[list[dict]], min_agree: float) -> list[dict]:
     """Merge pass-1 results from several frames of one camera.
 
-    Boxes from different frames are grouped by overlap (IoU > 0.5, at most one box per
-    frame per group). A group survives if enough frames contain it, and its box is the
-    per-coordinate median. This drops one-off boxes caused by a person or a bad frame.
-    Each frame's dicts must carry `norm`, a (x1, y1, x2, y2) box in 0-1000 coordinates.
+    Polygons from different frames are grouped by overlap (IoU > 0.5, at most one per
+    frame per group). A group survives if enough frames contain it, and its polygon is the
+    per-corner median. This drops one-off shapes caused by a person or a bad frame.
     """
     groups: list[list[tuple[int, dict]]] = []
     for fi, kept in enumerate(per_frame):
         for s in kept:
             for g in groups:
-                if all(fj != fi for fj, _ in g) and iou(s["norm"], g[0][1]["norm"]) > 0.5:
+                if all(fj != fi for fj, _ in g) and polygon_iou(s["polygon"], g[0][1]["polygon"]) > 0.5:
                     g.append((fi, s))
                     break
             else:
@@ -203,15 +170,20 @@ def consensus(per_frame: list[list[dict]], min_agree: float) -> list[dict]:
         if len(g) < need:
             continue
         members = [s for _, s in g]
+        median = [[round(statistics.median(m["polygon"][c][axis] for m in members)) for axis in (0, 1)]
+                  for c in range(4)]
+        polygon = clean_polygon(median)
+        if polygon is None:
+            continue
         best = max(members, key=lambda s: s["confidence"])
-        box = [round(statistics.median(m["norm"][i] for m in members)) for i in range(4)]
         regions.append({
             "label": best["label"],
             "kind": Counter(m["kind"] for m in members).most_common(1)[0][0],
+            "depth": Counter(m["depth"] for m in members).most_common(1)[0][0],
             "seen_in": f"{len(g)}/{len(per_frame)}",
-            "box_px": box,  # normalized x1, y1, x2, y2; converted when saved
+            "polygon": polygon,
         })
-    return number_left_to_right(regions)
+    return regions
 
 
 # ---------- saved regions ----------
@@ -226,7 +198,30 @@ def load_partition(args) -> dict:
     path = partition_path(args)
     if not path.exists():
         sys.exit(f"No saved regions at {path}. Run `detect --camera {args.camera} <frames>` first.")
-    return json.loads(path.read_text())
+    partition = json.loads(path.read_text())
+    if any("polygon" not in r for r in partition["regions"]):
+        sys.exit(f"{path} uses the old box format. Re-run `detect --camera {args.camera} ... --force`.")
+    return partition
+
+
+# ---------- drawing ----------
+
+def draw_overlay(img, kept, dropped=()):
+    out = img.copy()
+    h, w = img.shape[:2]
+    for d in dropped:
+        if d["polygon"]:
+            pts = to_pixels(d["polygon"], w, h).round().astype("int32")
+            cv2.polylines(out, [pts], True, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(out, "dropped", (int(pts[0][0]) + 4, int(pts[0][1]) + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    for k in kept:
+        pts = to_pixels(k["polygon"], w, h).round().astype("int32")
+        text = k["id"] + (f" {k['confidence']:.2f}" if k.get("confidence") is not None else "")
+        cv2.polylines(out, [pts], True, (0, 200, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, text, (int(pts[0][0]) + 4, int(pts[0][1]) + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
+    return out
 
 
 # ---------- pass 2 + output ----------
@@ -235,9 +230,11 @@ def score_regions(client, args, img, stem: str, kept: list[dict]) -> list[dict]:
     crops_dir = args.out_dir / f"{stem}_crops"
     if args.save_crops and kept:
         crops_dir.mkdir(parents=True, exist_ok=True)
+    polygons = {k["id"]: k["polygon"] for k in kept}
     regions = []
     for k in kept:
-        crop = crop_with_padding(img, k["box_px"], args.pad)
+        fronts = [polygons[i] for i in k["hidden_by"] if i in polygons]
+        crop = straighten(img, k["polygon"], fronts, args.pad)
         if args.save_crops:
             cv2.imwrite(str(crops_dir / f"{k['id']}.jpg"), crop)
         try:
@@ -253,10 +250,10 @@ def score_regions(client, args, img, stem: str, kept: list[dict]) -> list[dict]:
 
 
 def aggregate_regions(regions: list[dict], min_visible: float) -> dict:
-    """Totals only use regions visible enough to trust, weighted by box area."""
+    """Totals only use regions visible enough to trust, weighted by polygon area."""
     scored = [r for r in regions if r["metrics"]]
     usable = [r for r in scored if r["metrics"]["visible_fraction"] >= min_visible]
-    weights = [(r["box_px"][2] - r["box_px"][0]) * (r["box_px"][3] - r["box_px"][1]) for r in usable]
+    weights = [polygon_area(r["polygon"]) for r in usable]
     return {
         "regions_scored": len(scored),
         "regions_failed": len(regions) - len(scored),
@@ -304,7 +301,7 @@ def cmd_run(args) -> int:
     client = make_client(args)
     img = read_image(args.image)
     kept, dropped = detect_sections(client, args.model, img, args.min_confidence)
-    score_and_write(client, args, img, args.image, kept, dropped,
+    score_and_write(client, args, img, args.image, link_and_number(kept), dropped,
                     {"settings_pass1": {"min_confidence": args.min_confidence}})
     return 0
 
@@ -319,37 +316,27 @@ def cmd_detect(args) -> int:
     for image in args.images:
         img = read_image(image)
         first_img = img if first_img is None else first_img
-        h, w = img.shape[:2]
         print(f"{image.name}:", file=sys.stderr)
         kept, _ = detect_sections(client, args.model, img, args.min_confidence)
-        for k in kept:
-            x1, y1, x2, y2 = k["box_px"]
-            k["norm"] = (x1 / w * 1000, y1 / h * 1000, x2 / w * 1000, y2 / h * 1000)
         per_frame.append(kept)
 
-    merged = consensus(per_frame, args.min_agree)
+    regions = link_and_number(consensus(per_frame, args.min_agree))
     h, w = first_img.shape[:2]
-    regions = []
-    for r in merged:
-        box_2d = to_normalized([round(v / 1000 * d) for v, d in zip(r["box_px"], (w, h, w, h))], w, h)
-        regions.append({"id": r["id"], "label": r["label"], "kind": r["kind"],
-                        "seen_in": r["seen_in"], "box_2d": box_2d})
-
     partition = {
         "camera": args.camera,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "approved": False,
         "source_frames": [p.name for p in args.images],
         "frame_size": [w, h],
-        "regions": regions,
+        "regions": [{"id": r["id"], "label": r["label"], "kind": r["kind"], "seen_in": r["seen_in"],
+                     "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"]}
+                    for r in regions],
     }
     args.partitions_dir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(partition, indent=2) + "\n")
-    overlay_boxes = [{"id": r["id"], "confidence": None, "box_px": list(to_pixels(r["box_2d"], w, h))}
-                     for r in regions]
     overlay = args.partitions_dir / f"{args.camera}_overlay.jpg"
-    cv2.imwrite(str(overlay), draw_overlay(first_img, overlay_boxes))
-    print(f"Saved {len(regions)} regions to {path}\nCheck {overlay}, fix any boxes in the JSON, "
+    cv2.imwrite(str(overlay), draw_overlay(first_img, regions))
+    print(f"Saved {len(regions)} regions to {path}\nCheck {overlay}, fix any polygons in the JSON, "
           f"then run: python two_pass.py approve --camera {args.camera}")
     return 0
 
@@ -374,14 +361,11 @@ def cmd_score(args) -> int:
     sw, sh = partition["frame_size"]
     if abs(w / h - sw / sh) > 0.05:
         print(f"Warning: frame is {w}x{h} but regions were saved on {sw}x{sh}; "
-              f"boxes may not line up", file=sys.stderr)
+              f"polygons may not line up", file=sys.stderr)
 
-    kept = []
-    for r in partition["regions"]:
-        box = to_pixels(r["box_2d"], w, h)
-        if box:
-            kept.append({"id": r["id"], "label": r["label"], "kind": r["kind"],
-                         "confidence": None, "box_px": list(box)})
+    kept = [{"id": r["id"], "label": r["label"], "kind": r["kind"], "confidence": None,
+             "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"]}
+            for r in partition["regions"]]
     print(f"Using {len(kept)} saved regions for {args.camera!r} (pass 1 skipped)", file=sys.stderr)
     score_and_write(client, args, img, args.image, kept, [],
                     {"camera": args.camera, "regions_created": partition["created"]})
@@ -399,7 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
     scoring.add_argument("--out-dir", type=Path, default=Path("results/two_pass"))
     scoring.add_argument("--min-visible", type=float, default=0.5,
                          help="Exclude regions from the totals if less of them is visible")
-    scoring.add_argument("--pad", type=float, default=0.05, help="Crop padding as a fraction of box size")
+    scoring.add_argument("--pad", type=float, default=0.05, help="Crop padding as a fraction of size")
     scoring.add_argument("--save-crops", action="store_true", help="Save each crop next to the output")
 
     # Pass-1 confidence is self-reported by the model, so treat the threshold as a knob to tune.
