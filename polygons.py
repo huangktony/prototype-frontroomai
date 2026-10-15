@@ -62,6 +62,20 @@ def polygon_area(polygon: Polygon) -> float:
     return float(cv2.contourArea(to_pixels(polygon, GRID, GRID))) / (GRID * GRID)
 
 
+def clean_levels(levels: list[Polygon], unit: Polygon) -> list[Polygon]:
+    """Clean shelf-row polygons, keep those centred inside their unit, sort top to bottom."""
+    outline = to_pixels(unit, GRID, GRID)
+    kept = []
+    for level in levels:
+        level = clean_polygon(level)
+        if level is None:
+            continue
+        cx, cy = to_pixels(level, GRID, GRID).mean(axis=0)
+        if cv2.pointPolygonTest(outline, (float(cx), float(cy)), False) >= 0:
+            kept.append(level)
+    return sorted(kept, key=lambda p: sum(y for y, _ in p))
+
+
 def polygon_iou(a: Polygon, b: Polygon) -> float:
     ma, mb = polygon_mask(a, IOU_GRID, IOU_GRID), polygon_mask(b, IOU_GRID, IOU_GRID)
     union = np.count_nonzero(cv2.bitwise_or(ma, mb))
@@ -104,9 +118,10 @@ def link_and_number(regions: list[dict]) -> list[dict]:
 
 
 def straighten(image: np.ndarray, polygon: Polygon, front_polygons: list[Polygon],
-               pad: float) -> np.ndarray:
+               pad: float, levels: list[Polygon] = ()) -> np.ndarray:
     """Warp the polygon to an upright rectangle, enlarged for detail, with nearer regions
-    in front of it (and anything outside the frame) filled flat grey."""
+    in front of it (and anything outside the frame) filled flat grey. Shelf-row polygons
+    in `levels` are outlined and labelled L1, L2, ... from the top."""
     h, w = image.shape[:2]
     if front_polygons:
         image = image.copy()
@@ -124,5 +139,15 @@ def straighten(image: np.ndarray, polygon: Polygon, front_polygons: list[Polygon
     out_w, out_h = max(round(width * scale), 1), max(round(height * scale), 1)
     warp = cv2.getPerspectiveTransform(
         quad.astype(np.float32), np.float32([[0, 0], [out_w, 0], [out_w, out_h], [0, out_h]]))
-    return cv2.warpPerspective(image, warp, (out_w, out_h), flags=cv2.INTER_CUBIC,
-                               borderMode=cv2.BORDER_CONSTANT, borderValue=(HIDDEN_GREY,) * 3)
+    out = cv2.warpPerspective(image, warp, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(HIDDEN_GREY,) * 3)
+
+    # Draw after warping so outlines stay thin relative to the products.
+    for n, level in enumerate(levels, 1):
+        pts = cv2.perspectiveTransform(to_pixels(level, w, h).reshape(-1, 1, 2), warp)
+        pts = pts.reshape(-1, 2).round().astype(np.int32)
+        cv2.polylines(out, [pts], True, (0, 255, 255), 2, cv2.LINE_AA)
+        org = (int(pts[0][0]) + 4, int(pts[0][1]) + 22)
+        cv2.putText(out, f"L{n}", org, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(out, f"L{n}", org, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    return out

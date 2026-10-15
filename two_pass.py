@@ -2,9 +2,10 @@
 """Two-pass shelf analysis with saved per-camera regions.
 
 Pass 1 asks Gemini for shelf sections as 4-corner polygons (with confidence and depth) on
-the full frame. Weak sections are dropped (low confidence, bad geometry, duplicates). Pass 2
-straightens each kept section into an upright crop, greys out nearer units standing in
-front of it, and scores it on its own. Polygon handling is adapted from Parth's
+the full frame, plus a 4-corner polygon for each shelf row inside each section. Weak
+sections are dropped (low confidence, bad geometry, duplicates). Pass 2 straightens each
+kept section into an upright crop with its rows outlined as L1, L2, ..., greys out nearer
+units standing in front of it, and scores the section and each row on its own. Polygon handling is adapted from Parth's
 parthswork/polygons branch (see polygons.py).
 
 A fixed camera sees the same shelves every time, so pass 1 only needs to run once:
@@ -39,8 +40,8 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
-from polygons import (Polygon, clean_polygon, link_and_number, polygon_area, polygon_iou,
-                      straighten, to_pixels)
+from polygons import (Polygon, clean_levels, clean_polygon, link_and_number, polygon_area,
+                      polygon_iou, straighten, to_pixels)
 from shelf_metrics import DEFAULT_MODEL, QuotaExhausted, generate_structured
 
 POLYGON_HELP = ("4 corners [[y, x], ...] normalised 0-1000, in the order top-left, "
@@ -55,6 +56,11 @@ For each, give a short label and a polygon of exactly 4 corners tracing its
 product-facing front face as it appears in perspective (a shelf seen at an angle is a
 slanted quadrilateral, not an upright rectangle). Give corners as [y, x] normalised to
 0-1000, in the order top-left, top-right, bottom-right, bottom-left.
+
+Inside each section, also give one 4-corner polygon per shelf row (tier), from the top
+row to the bottom, each following the slope of that shelf's front edge, in the same
+corner order. Leave out rows you cannot see at all. Give each row a `confidence` (0-1)
+for how sure you are that it is a real shelf row whose products you can make out.
 
 Give each a depth rank: 1 for the units nearest the camera, then 2, 3, ... for units
 further back; units at about the same distance share a rank. Trace each unit's whole
@@ -75,27 +81,42 @@ Estimate its stock state from what is visible. Do not guess about parts you cann
 (grey areas, people, carts and glare all reduce it). Percentages are 0-100."""
 
 
+class SectionLevel(BaseModel):
+    polygon: Polygon = Field(description=POLYGON_HELP)
+    confidence: float = Field(description="0-1, how sure this is a real, visible shelf row")
+
+
 class Section(BaseModel):
     label: str
     kind: Literal["gondola", "wall_shelf", "cooler", "endcap", "other"]
     polygon: Polygon = Field(description=POLYGON_HELP)
     depth: int = Field(description="1 = nearest the camera; higher = further back")
     confidence: float = Field(description="0-1, how sure this is a real, visible shelf section")
+    levels: list[SectionLevel] = Field(description="Shelf rows inside this section, top to bottom")
 
 
 class Sections(BaseModel):
     sections: list[Section]
 
 
-class RegionMetrics(BaseModel):
-    fill_percent: float = Field(description="How full the section is, 0-100")
+class StockMetrics(BaseModel):
+    """Scored for the whole section, and again for each shelf row in it."""
+    fill_percent: float = Field(description="How full it is, 0-100")
     empty_gap_count: int = Field(description="Visible out-of-stock gaps")
     stock_status: Literal["well_stocked", "partially_stocked", "low_stock", "empty", "unknown"]
     estimated_facings: int
     tidiness_score: int = Field(description="1 (messy) to 5 (neat, faced)")
     people_occluding_shelf: bool
-    visible_fraction: float = Field(description="0-1, how much of the section is visible")
+    visible_fraction: float = Field(description="0-1, how much of it is visible")
     notes: str
+
+
+class LevelMetrics(StockMetrics):
+    level: int = Field(description="Row number as labelled on the image (L1 = 1 = top)")
+
+
+class RegionMetrics(StockMetrics):
+    levels: list[LevelMetrics] = Field(description="One entry per labelled shelf row")
 
 
 # ---------- pass 1 ----------
@@ -107,8 +128,9 @@ def jpeg_part(img) -> types.Part:
     return types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg")
 
 
-def filter_sections(sections: list[Section], min_conf: float):
-    """Drop invalid, low-confidence, odd-shaped, or duplicate sections. Returns (kept, dropped)."""
+def filter_sections(sections: list[Section], min_conf: float, min_row_conf: float):
+    """Drop invalid, low-confidence, odd-shaped, or duplicate sections, and low-confidence
+    shelf rows inside kept ones. Returns (kept, dropped)."""
     kept, dropped = [], []
     # Highest confidence first, so duplicates lose to the better polygon.
     for s in sorted(sections, key=lambda s: s.confidence, reverse=True):
@@ -118,6 +140,10 @@ def filter_sections(sections: list[Section], min_conf: float):
             dropped.append({**info, "polygon": None, "reason": "invalid polygon"})
             continue
         info["polygon"] = polygon
+        info["levels"] = [{"level": n, "polygon": p} for n, p in
+                          enumerate(clean_levels([l.polygon for l in s.levels
+                                                   if l.confidence >= min_row_conf], polygon), 1)]
+        info["rows_dropped"] = len(s.levels) - len(info["levels"])
         area = polygon_area(polygon)
         xs, ys = [x for _, x in polygon], [y for y, _ in polygon]
         aspect = (max(xs) - min(xs)) / max(max(ys) - min(ys), 1)
@@ -136,11 +162,14 @@ def filter_sections(sections: list[Section], min_conf: float):
     return kept, dropped
 
 
-def detect_sections(client, model: str, img, min_conf: float):
+def detect_sections(client, model: str, img, min_conf: float, min_row_conf: float):
     """Run pass 1 on one frame. Returns (kept, dropped); kept isn't numbered yet."""
     found = generate_structured(client, model, [jpeg_part(img), PASS1_PROMPT], Sections)
-    kept, dropped = filter_sections(found.sections, min_conf)
-    print(f"Pass 1: {len(found.sections)} sections found, {len(kept)} kept, {len(dropped)} dropped",
+    kept, dropped = filter_sections(found.sections, min_conf, min_row_conf)
+    rows = sum(len(k["levels"]) for k in kept)
+    rows_dropped = sum(k.pop("rows_dropped") for k in kept)
+    print(f"Pass 1: {len(found.sections)} sections found, {len(kept)} kept, {len(dropped)} dropped; "
+          f"{rows} shelf rows kept, {rows_dropped} dropped (low confidence or invalid)",
           file=sys.stderr)
     for d in dropped:
         print(f"  dropped {d['label']!r}: {d['reason']}", file=sys.stderr)
@@ -175,6 +204,14 @@ def consensus(per_frame: list[list[dict]], min_agree: float) -> list[dict]:
         polygon = clean_polygon(median)
         if polygon is None:
             continue
+        # Rows: use the frames that agree most often on the row count, median each corner.
+        row_count = Counter(len(m["levels"]) for m in members).most_common(1)[0][0]
+        with_rows = [m for m in members if len(m["levels"]) == row_count]
+        level_polygons = [clean_polygon([[round(statistics.median(m["levels"][n]["polygon"][c][axis]
+                                                                 for m in with_rows))
+                                          for axis in (0, 1)] for c in range(4)])
+                          for n in range(row_count)]
+        levels = clean_levels([p for p in level_polygons if p], polygon)
         best = max(members, key=lambda s: s["confidence"])
         regions.append({
             "label": best["label"],
@@ -182,6 +219,7 @@ def consensus(per_frame: list[list[dict]], min_agree: float) -> list[dict]:
             "depth": Counter(m["depth"] for m in members).most_common(1)[0][0],
             "seen_in": f"{len(g)}/{len(per_frame)}",
             "polygon": polygon,
+            "levels": [{"level": n, "polygon": p} for n, p in enumerate(levels, 1)],
         })
     return regions
 
@@ -216,6 +254,9 @@ def draw_overlay(img, kept, dropped=()):
             cv2.putText(out, "dropped", (int(pts[0][0]) + 4, int(pts[0][1]) + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
     for k in kept:
+        for level in k.get("levels", []):
+            lpts = to_pixels(level["polygon"], w, h).round().astype("int32")
+            cv2.polylines(out, [lpts], True, (0, 215, 255), 1, cv2.LINE_AA)
         pts = to_pixels(k["polygon"], w, h).round().astype("int32")
         text = k["id"] + (f" {k['confidence']:.2f}" if k.get("confidence") is not None else "")
         cv2.polylines(out, [pts], True, (0, 200, 0), 3, cv2.LINE_AA)
@@ -225,6 +266,16 @@ def draw_overlay(img, kept, dropped=()):
 
 
 # ---------- pass 2 + output ----------
+
+def pass2_prompt(row_count: int) -> str:
+    if row_count:
+        labels = ", ".join(f"L{n}" for n in range(1, row_count + 1))
+        rows = (f"Yellow outlines mark its {row_count} shelf rows, labelled {labels} from top to "
+                f"bottom; give one `levels` entry per label.")
+    else:
+        rows = "No shelf rows are marked; split it into rows yourself in `levels`, 1 = top."
+    return PASS2_PROMPT + "\n" + rows
+
 
 def score_regions(client, args, img, stem: str, kept: list[dict]) -> list[dict]:
     crops_dir = args.out_dir / f"{stem}_crops"
@@ -238,11 +289,13 @@ def score_regions(client, args, img, stem: str, kept: list[dict]) -> list[dict]:
             regions.append({**k, "metrics": None, "error": "not scored: quota exhausted"})
             continue
         fronts = [polygons[i] for i in k["hidden_by"] if i in polygons]
-        crop = straighten(img, k["polygon"], fronts, args.pad)
+        levels = [l["polygon"] for l in k.get("levels", [])]
+        crop = straighten(img, k["polygon"], fronts, args.pad, levels)
         if args.save_crops:
             cv2.imwrite(str(crops_dir / f"{k['id']}.jpg"), crop)
         try:
-            metrics = generate_structured(client, args.model, [jpeg_part(crop), PASS2_PROMPT], RegionMetrics)
+            metrics = generate_structured(client, args.model, [jpeg_part(crop), pass2_prompt(len(levels))],
+                                          RegionMetrics)
         except errors.ServerError as e:  # retries exhausted; keep the rest of the run
             regions.append({**k, "metrics": None, "error": f"{e.code} {e.status}"})
             print(f"  {k['id']} {k['label']!r}: FAILED ({e.code}), skipping", file=sys.stderr)
@@ -253,8 +306,10 @@ def score_regions(client, args, img, stem: str, kept: list[dict]) -> list[dict]:
             print(f"  {k['id']} {k['label']!r}: {e}", file=sys.stderr)
             continue
         regions.append({**k, "metrics": metrics.model_dump()})
+        rows = " ".join(f"L{l.level}={l.fill_percent:.0f}%" for l in metrics.levels)
         print(f"  {k['id']} {k['label']!r}: fill {metrics.fill_percent:.0f}%, "
-              f"gaps {metrics.empty_gap_count}, visible {metrics.visible_fraction:.0%}", file=sys.stderr)
+              f"gaps {metrics.empty_gap_count}, visible {metrics.visible_fraction:.0%}  {rows}",
+              file=sys.stderr)
     return regions
 
 
@@ -309,9 +364,11 @@ def read_image(path: Path):
 def cmd_run(args) -> int:
     client = make_client(args)
     img = read_image(args.image)
-    kept, dropped = detect_sections(client, args.model, img, args.min_confidence)
+    kept, dropped = detect_sections(client, args.model, img, args.min_confidence,
+                                    args.min_row_confidence)
     score_and_write(client, args, img, args.image, link_and_number(kept), dropped,
-                    {"settings_pass1": {"min_confidence": args.min_confidence}})
+                    {"settings_pass1": {"min_confidence": args.min_confidence,
+                                        "min_row_confidence": args.min_row_confidence}})
     return 0
 
 
@@ -326,7 +383,8 @@ def cmd_detect(args) -> int:
         img = read_image(image)
         first_img = img if first_img is None else first_img
         print(f"{image.name}:", file=sys.stderr)
-        kept, _ = detect_sections(client, args.model, img, args.min_confidence)
+        kept, _ = detect_sections(client, args.model, img, args.min_confidence,
+                                  args.min_row_confidence)
         per_frame.append(kept)
 
     regions = link_and_number(consensus(per_frame, args.min_agree))
@@ -338,7 +396,8 @@ def cmd_detect(args) -> int:
         "source_frames": [p.name for p in args.images],
         "frame_size": [w, h],
         "regions": [{"id": r["id"], "label": r["label"], "kind": r["kind"], "seen_in": r["seen_in"],
-                     "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"]}
+                     "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"],
+                     "levels": r["levels"]}
                     for r in regions],
     }
     args.partitions_dir.mkdir(parents=True, exist_ok=True)
@@ -373,7 +432,8 @@ def cmd_score(args) -> int:
               f"polygons may not line up", file=sys.stderr)
 
     kept = [{"id": r["id"], "label": r["label"], "kind": r["kind"], "confidence": None,
-             "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"]}
+             "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"],
+             "levels": r.get("levels", [])}
             for r in partition["regions"]]
     print(f"Using {len(kept)} saved regions for {args.camera!r} (pass 1 skipped)", file=sys.stderr)
     score_and_write(client, args, img, args.image, kept, [],
@@ -399,6 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
     conf = argparse.ArgumentParser(add_help=False)
     conf.add_argument("--min-confidence", type=float, default=0.6,
                       help="Drop pass-1 sections below this confidence")
+    # Rows are only considered inside sections that already passed --min-confidence, and are
+    # smaller and harder to make out, so they get a slightly lower bar.
+    conf.add_argument("--min-row-confidence", type=float, default=0.5,
+                      help="Drop shelf rows below this confidence")
 
     cam = argparse.ArgumentParser(add_help=False)
     cam.add_argument("--camera", required=True, help="Camera name; regions are saved under this name")
