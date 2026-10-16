@@ -21,9 +21,14 @@ A fixed camera sees the same shelves every time, so pass 1 only needs to run onc
     # Or run both passes on one frame with nothing saved
     python two_pass.py run frame.jpg
 
+    # Or a whole video: find shelves on its first frame (once per camera), then score a
+    # frame every --every seconds against them
+    python two_pass.py video videos/4WXZTF7EWL0.mp4 --every 2
+
 Scoring writes <out-dir>/<name>.json and <out-dir>/<name>_overlay.jpg.
 """
 import argparse
+import csv
 import json
 import math
 import os
@@ -330,7 +335,8 @@ def aggregate_regions(regions: list[dict], min_visible: float) -> dict:
     }
 
 
-def score_and_write(client, args, img, image: Path, kept, dropped, extra: dict) -> None:
+def score_and_write(client, args, img, image: Path, kept, dropped, extra: dict,
+                    print_json: bool = True) -> dict:
     h, w = img.shape[:2]
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(args.out_dir / f"{image.stem}_overlay.jpg"), draw_overlay(img, kept, dropped))
@@ -342,7 +348,9 @@ def score_and_write(client, args, img, image: Path, kept, dropped, extra: dict) 
     }
     output = json.dumps(result, indent=2)
     (args.out_dir / f"{image.stem}.json").write_text(output + "\n")
-    print(output)
+    if print_json:
+        print(output)
+    return result
 
 
 # ---------- commands ----------
@@ -388,12 +396,20 @@ def cmd_detect(args) -> int:
         per_frame.append(kept)
 
     regions = link_and_number(consensus(per_frame, args.min_agree))
+    save_partition(args, regions, [p.name for p in args.images], first_img)
+    print(f"Check the overlay, fix any polygons in the JSON, then run: "
+          f"python two_pass.py approve --camera {args.camera}")
+    return 0
+
+
+def save_partition(args, regions: list[dict], source_frames: list[str], first_img) -> None:
+    path = partition_path(args)
     h, w = first_img.shape[:2]
     partition = {
         "camera": args.camera,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "approved": False,
-        "source_frames": [p.name for p in args.images],
+        "source_frames": source_frames,
         "frame_size": [w, h],
         "regions": [{"id": r["id"], "label": r["label"], "kind": r["kind"], "seen_in": r["seen_in"],
                      "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"],
@@ -404,9 +420,8 @@ def cmd_detect(args) -> int:
     path.write_text(json.dumps(partition, indent=2) + "\n")
     overlay = args.partitions_dir / f"{args.camera}_overlay.jpg"
     cv2.imwrite(str(overlay), draw_overlay(first_img, regions))
-    print(f"Saved {len(regions)} regions to {path}\nCheck {overlay}, fix any polygons in the JSON, "
-          f"then run: python two_pass.py approve --camera {args.camera}")
-    return 0
+    rows = sum(len(r["levels"]) for r in regions)
+    print(f"Saved {len(regions)} regions ({rows} shelf rows) to {path}; overlay: {overlay}")
 
 
 def cmd_approve(args) -> int:
@@ -415,6 +430,85 @@ def cmd_approve(args) -> int:
     partition["approved"] = True
     path.write_text(json.dumps(partition, indent=2) + "\n")
     print(f"Approved {len(partition['regions'])} regions for camera {args.camera!r}")
+    return 0
+
+
+def saved_regions(partition: dict) -> list[dict]:
+    return [{"id": r["id"], "label": r["label"], "kind": r["kind"], "confidence": None,
+             "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"],
+             "levels": r.get("levels", [])}
+            for r in partition["regions"]]
+
+
+def video_frames(path: Path, every: float, start: float, end: float | None):
+    """Yield (seconds, frame) every `every` seconds, like extract_frames.py."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        sys.exit(f"Can't open {path} as a video")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
+    end = min(end, duration) if end else duration
+    t = start
+    try:
+        while t < end:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                break
+            yield t, frame
+            t += every
+    finally:
+        cap.release()
+
+
+def cmd_video(args) -> int:
+    args.camera = args.camera or args.video.stem
+    path = partition_path(args)
+    client = make_client(args)
+    frames = video_frames(args.video, args.every, args.start, args.end)
+    first = next(frames, None)
+    if first is None:
+        sys.exit(f"No frames read from {args.video}")
+
+    # Pass 1 only once per camera: on the video's first frame, unless regions are saved.
+    if path.exists() and not args.force:
+        partition = load_partition(args)
+        print(f"Using {len(partition['regions'])} saved regions for {args.camera!r} "
+              f"(pass 1 skipped)", file=sys.stderr)
+    else:
+        print(f"Finding shelves on the first frame ({first[0]:.0f}s):", file=sys.stderr)
+        kept, _ = detect_sections(client, args.model, first[1], args.min_confidence,
+                                  args.min_row_confidence)
+        # One frame, so consensus keeps every shape as is; it just adds the same fields as `detect`.
+        regions = link_and_number(consensus([kept], 1.0))
+        save_partition(args, regions, [f"{args.video.name}@{first[0]:.0f}s"], first[1])
+        partition = load_partition(args)
+    if not partition["approved"] and not args.allow_unapproved:
+        sys.exit(f"Regions for {args.camera!r} aren't approved. Check "
+                 f"{args.partitions_dir / (args.camera + '_overlay.jpg')}, then run "
+                 f"`approve --camera {args.camera}` and this command again "
+                 f"(or pass --allow-unapproved).")
+    kept = saved_regions(partition)
+
+    rows = []
+    for t, img in [first, *frames]:
+        name = Path(f"{args.video.stem}_{int(t):05d}s.jpg")
+        print(f"{name.stem}:", file=sys.stderr)
+        result = score_and_write(client, args, img, name, kept, [],
+                                 {"camera": args.camera, "video": args.video.name, "seconds": t,
+                                  "regions_created": partition["created"]}, print_json=False)
+        agg = result["aggregate"]
+        rows.append({"frame": name.stem, "seconds": round(t, 1), **agg})
+        if any(r.get("error") == "not scored: quota exhausted" for r in result["regions"]):
+            print("Stopping: Gemini quota exhausted. Frames scored so far are saved.", file=sys.stderr)
+            break
+
+    summary = args.out_dir / f"{args.video.stem}_summary.csv"
+    with open(summary, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Scored {len(rows)} frames; per-frame JSON in {args.out_dir}/, summary: {summary}")
     return 0
 
 
@@ -431,10 +525,7 @@ def cmd_score(args) -> int:
         print(f"Warning: frame is {w}x{h} but regions were saved on {sw}x{sh}; "
               f"polygons may not line up", file=sys.stderr)
 
-    kept = [{"id": r["id"], "label": r["label"], "kind": r["kind"], "confidence": None,
-             "depth": r["depth"], "hidden_by": r["hidden_by"], "polygon": r["polygon"],
-             "levels": r.get("levels", [])}
-            for r in partition["regions"]]
+    kept = saved_regions(partition)
     print(f"Using {len(kept)} saved regions for {args.camera!r} (pass 1 skipped)", file=sys.stderr)
     score_and_write(client, args, img, args.image, kept, [],
                     {"camera": args.camera, "regions_created": partition["created"]})
@@ -486,6 +577,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("image", type=Path)
     p.add_argument("--allow-unapproved", action="store_true")
     p.set_defaults(func=cmd_score)
+
+    p = sub.add_parser("video", parents=[common, scoring, conf],
+                       help="Find shelves on a video's first frame, then score frames through it")
+    p.add_argument("video", type=Path)
+    p.add_argument("--camera", help="Camera name (default: the video's file name)")
+    p.add_argument("--partitions-dir", type=Path, default=Path("partitions"))
+    p.add_argument("--every", type=float, default=2, help="Seconds between scored frames")
+    p.add_argument("--start", type=float, default=0, help="Start time in seconds")
+    p.add_argument("--end", type=float, help="End time in seconds (default: end of video)")
+    p.add_argument("--force", action="store_true", help="Re-find shelves even if regions are saved")
+    p.add_argument("--allow-unapproved", action="store_true",
+                   help="Score straight away without approving newly found regions")
+    p.set_defaults(func=cmd_video)
     return parser
 
 
